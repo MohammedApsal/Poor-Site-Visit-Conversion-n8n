@@ -1,0 +1,1678 @@
+{
+  "name": "Enterprise Site-Visit Booking, Navigation & Attendance Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## PRODUCTION REAL ESTATE SITE-VISIT ENGINE\n- **WF-01 (Booking Orchestrator)**: Atomic reservation, turn-by-turn driving deep link, sequential outbox queuing.\n- **WF-02 (Message Dispatcher)**: 1-minute poller with row-level locks (`FOR UPDATE SKIP LOCKED`) for WA, Email, and Slack.\n- **WF-03 (Precision Reminders)**: 10-minute cron tracking 24h, 2h, 30m, and arrival transitions.\n- **WF-04 (Gate Check-In & No-Show Sweeper)**: Boom-barrier QR check-in & 30-minute automated no-show detection.\n- **WF-05 (Post-Visit Follow-Up)**: Automated 1-hour post-visit survey & sales rep re-engagement task.",
+        "height": 240,
+        "width": 1050,
+        "color": 6
+      },
+      "id": "fafde6ab-d8b8-41e1-afee-da46c38dc758",
+      "name": "Engine Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1232,
+        4064
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sitevisit/v2/book",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "5ae1c7f0-d93f-44df-9417-e55bdec59fb3",
+      "name": "Book Visit Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        4352
+      ],
+      "webhookId": "sitevisit-book-v2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst b = $input.item.json.body || {};\nconst headers = $input.item.json.headers || {};\nconst apiKey = headers['x-api-key'] || '';\nconst authOk = !process.env.BOOKING_API_KEY || apiKey === process.env.BOOKING_API_KEY;\n\nconst required = ['request_id', 'lead_phone', 'rep_id', 'project_id', 'proposed_time'];\nconst missing = required.filter(k => !b[k]);\n\nlet phone = String(b.lead_phone || '').replace(/[^0-9+]/g, '');\nif (phone.length === 10) phone = '+91' + phone;\nelse if (!phone.startsWith('+') && phone.length > 10) phone = '+' + phone;\n\nreturn {\n  json: {\n    ...b,\n    lead_phone: phone,\n    auth_ok: authOk,\n    valid: authOk && missing.length === 0,\n    missing\n  }\n};"
+      },
+      "id": "e304b4b2-d1df-44ed-95fb-88ca058fd7ad",
+      "name": "Validate + Authenticate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "235ae829-fdab-422d-b496-9ace78cd8ce0",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1696,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.auth_ok ? { error: 'missing required fields', missing: $json.missing } : { error: 'unauthorized' } }}",
+        "options": {
+          "responseCode": "={{ $json.auth_ok ? 400 : 401 }}"
+        }
+      },
+      "id": "d1e422e3-c20c-4d84-9af5-d5e235751612",
+      "name": "Respond 401/400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1696,
+        4544
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT response_body FROM sitevisits.idempotency_keys WHERE request_key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.request_id] }}"
+        }
+      },
+      "id": "c73bbe13-5959-49e3-94b2-2f146d4ad113",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1920,
+        4352
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.response_body }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56234c4b-a843-4fc4-ae57-9e398e424adf",
+      "name": "Already Processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2144,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ typeof $json.response_body === 'string' ? JSON.parse($json.response_body) : $json.response_body }}",
+        "options": {}
+      },
+      "id": "07f6a28a-eca4-419e-bddd-15e7080b0f16",
+      "name": "Respond Cached Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2144,
+        4544
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT r.calendar_id, r.rep_name, r.phone_e164 AS rep_phone, r.email AS rep_email, r.slack_user_id, p.name AS project_name, p.site_address, p.site_lat, p.site_lng\nFROM sitevisits.reps r, sitevisits.projects p\nWHERE r.rep_id = $1 AND p.id = $2\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [$('Validate + Authenticate').first().json.rep_id, $('Validate + Authenticate').first().json.project_id] }}"
+        }
+      },
+      "id": "b81f0ad7-21d3-4b24-af3a-612a16821abe",
+      "name": "Get Lead / Project",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2368,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.site_visits (\n  lead_phone, lead_email, lead_name, rep_id, project_id, scheduled_at, status\n)\nSELECT $1, $2, $3, $4, $5, $6::timestamptz, 'pending_confirmation'\nWHERE NOT EXISTS (\n  SELECT 1 FROM sitevisits.site_visits\n  WHERE rep_id = $4\n    AND status NOT IN ('cancelled', 'no_show')\n    AND scheduled_at BETWEEN $6::timestamptz - interval '45 minutes'\n                         AND $6::timestamptz + interval '45 minutes'\n)\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Validate + Authenticate').first().json.lead_phone,\n  $('Validate + Authenticate').first().json.lead_email,\n  $('Validate + Authenticate').first().json.lead_name || 'Valued Buyer',\n  $('Validate + Authenticate').first().json.rep_id,\n  $('Validate + Authenticate').first().json.project_id,\n  $('Validate + Authenticate').first().json.proposed_time\n] }}"
+        }
+      },
+      "id": "ceaa0f5b-5b69-4770-9818-f7135b45a3d0",
+      "name": "Reserve & Create Booking",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2592,
+        4352
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "be9aa4c8-2c0e-4ebc-a99b-4e79223b8f09",
+      "name": "Slot Reserved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2816,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'slot_unavailable', message: 'The requested sales representative is already booked for this time window.' } }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "8f6f2ac4-7d47-431b-a4fc-9cd733a61adc",
+      "name": "Respond: Slot Taken",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2816,
+        4544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const booking = $input.first().json;\nconst meta = $('Get Lead / Project').first().json;\nconst auth = $('Validate + Authenticate').first().json;\n\nconst lat = meta.site_lat || '12.9716';\nconst lng = meta.site_lng || '77.5946';\n\nconst mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}&travelmode=driving`;\nconst gatePassCode = 'VP-' + Math.random().toString(36).slice(2, 8).toUpperCase();\nconst driverText = `🚗 SITE VISIT: ${meta.project_name}\\nDate & Time: ${auth.proposed_time}\\nSecurity Pass: ${gatePassCode}\\nAddress: ${meta.site_address}\\nDirections: ${mapsUrl}`;\n\nreturn {\n  json: {\n    visit_id: booking.id,\n    request_id: auth.request_id,\n    lead_name: auth.lead_name || 'Valued Buyer',\n    lead_phone: auth.lead_phone,\n    lead_email: auth.lead_email || null,\n    project_id: auth.project_id,\n    project_name: meta.project_name,\n    site_address: meta.site_address,\n    rep_name: meta.rep_name,\n    rep_phone: meta.rep_phone,\n    rep_email: meta.rep_email,\n    slack_user_id: meta.slack_user_id,\n    proposed_time: auth.proposed_time,\n    gate_pass_code: gatePassCode,\n    maps_url: mapsUrl,\n    driver_share_text: driverText\n  }\n};"
+      },
+      "id": "58fb728a-2d14-4310-a848-4d1f72c5afde",
+      "name": "Build Visit Assets & Deep Link",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "mode": "list",
+          "value": "primary"
+        },
+        "start": "={{ $json.proposed_time }}",
+        "end": "={{ new Date(new Date($json.proposed_time).getTime() + 45*60000).toISOString() }}",
+        "additionalFields": {
+          "attendees": "={{ [$json.lead_email].filter(Boolean) }}"
+        }
+      },
+      "id": "37c0c83b-9b9a-4265-b025-1dbeffc399b3",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        3264,
+        4352
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits \nSET \n  calendar_event_id = $1, \n  gate_pass_code = $2,\n  status = 'confirmed',\n  updated_at = NOW()\nWHERE id = $3;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.id || 'N/A',\n  $('Build Visit Assets & Deep Link').first().json.gate_pass_code,\n  $('Build Visit Assets & Deep Link').first().json.visit_id\n] }}"
+        }
+      },
+      "id": "ee148b1b-74e1-4e2c-ab2e-647a76a4f21f",
+      "name": "Update Booking State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3488,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'whatsapp', 'booking_confirmation', $2::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Visit Assets & Deep Link').first().json.visit_id,\n  JSON.stringify({\n    lead_phone: $('Build Visit Assets & Deep Link').first().json.lead_phone,\n    lead_name: $('Build Visit Assets & Deep Link').first().json.lead_name,\n    project_name: $('Build Visit Assets & Deep Link').first().json.project_name,\n    proposed_time: $('Build Visit Assets & Deep Link').first().json.proposed_time,\n    maps_url: $('Build Visit Assets & Deep Link').first().json.maps_url,\n    gate_pass_code: $('Build Visit Assets & Deep Link').first().json.gate_pass_code,\n    rep_name: $('Build Visit Assets & Deep Link').first().json.rep_name,\n    rep_phone: $('Build Visit Assets & Deep Link').first().json.rep_phone,\n    driver_share_text: $('Build Visit Assets & Deep Link').first().json.driver_share_text\n  })\n] }}"
+        }
+      },
+      "id": "728a5dff-819e-427e-b07e-2be33a45c460",
+      "name": "Write Outbox: WhatsApp",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3712,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nSELECT $1, 'email', 'booking_confirmation', $2::jsonb\nWHERE $3 IS NOT NULL;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Visit Assets & Deep Link').first().json.visit_id,\n  JSON.stringify({\n    lead_email: $('Build Visit Assets & Deep Link').first().json.lead_email,\n    project_name: $('Build Visit Assets & Deep Link').first().json.project_name,\n    proposed_time: $('Build Visit Assets & Deep Link').first().json.proposed_time,\n    maps_url: $('Build Visit Assets & Deep Link').first().json.maps_url,\n    gate_pass_code: $('Build Visit Assets & Deep Link').first().json.gate_pass_code\n  }),\n  $('Build Visit Assets & Deep Link').first().json.lead_email\n] }}"
+        }
+      },
+      "id": "18053926-eb35-4586-9080-7d94d5b7d2d6",
+      "name": "Write Outbox: Email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3936,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'crm_slack', 'booking_confirmation', $2::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Visit Assets & Deep Link').first().json.visit_id,\n  JSON.stringify({\n    slack_user_id: $('Build Visit Assets & Deep Link').first().json.slack_user_id,\n    rep_name: $('Build Visit Assets & Deep Link').first().json.rep_name,\n    lead_name: $('Build Visit Assets & Deep Link').first().json.lead_name,\n    lead_phone: $('Build Visit Assets & Deep Link').first().json.lead_phone,\n    proposed_time: $('Build Visit Assets & Deep Link').first().json.proposed_time\n  })\n] }}"
+        }
+      },
+      "id": "32861c50-dd3e-4d5f-87cd-022c1ce5e863",
+      "name": "Write Outbox: CRM/Slack",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4160,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.idempotency_keys (request_key, response_body)\nVALUES ($1, $2::jsonb)\nON CONFLICT (request_key) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Visit Assets & Deep Link').first().json.request_id,\n  JSON.stringify({\n    status: 'booked',\n    visit_id: $('Build Visit Assets & Deep Link').first().json.visit_id,\n    gate_pass_code: $('Build Visit Assets & Deep Link').first().json.gate_pass_code\n  })\n] }}"
+        }
+      },
+      "id": "c5ae9591-4d14-47b7-b074-858e9d1016c1",
+      "name": "Record Idempotency Key",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4384,
+        4352
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: 'booked',\n  visit_id: $('Build Visit Assets & Deep Link').first().json.visit_id,\n  gate_pass_code: $('Build Visit Assets & Deep Link').first().json.gate_pass_code,\n  maps_url: $('Build Visit Assets & Deep Link').first().json.maps_url\n} }}",
+        "options": {}
+      },
+      "id": "0ce8aae2-26f7-45d0-92f2-a9f9ef180505",
+      "name": "Respond 200 (Booked)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        4608,
+        4352
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "ead8d153-0db5-4cf3-bd88-d5f40dd5adde",
+      "name": "Every 1 Minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1184,
+        5104
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.outbox_actions\nSET status = 'claimed', claimed_at = now()\nWHERE id IN (\n  SELECT id FROM sitevisits.outbox_actions\n  WHERE status = 'pending' AND scheduled_at <= now()\n  ORDER BY scheduled_at ASC\n  LIMIT 25\n  FOR UPDATE SKIP LOCKED\n)\nRETURNING *;",
+        "options": {}
+      },
+      "id": "a69d9938-6c9a-4a98-a2be-18112c3733f8",
+      "name": "Claim Outbox Actions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1408,
+        5104
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "0608ef23-aafa-4761-a752-217518e12c48",
+      "name": "Loop Over Actions",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1632,
+        5104
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "whatsapp"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "email"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "crm_slack",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "crm_slack"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "fdb06260-49fb-4547-b4c0-5c286d233aa7",
+      "name": "Route By Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1856,
+        5104
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "YOUR_WHATSAPP_PHONE_NUMBER_ID",
+        "recipientPhoneNumber": "={{ $json.payload.lead_phone }}",
+        "textBody": "=🚗 *Site Visit Confirmed: {{ $json.payload.project_name }}*\n\nHello {{ $json.payload.lead_name || 'Buyer' }},\nYour site visit is scheduled for *{{ $json.payload.proposed_time }}*.\n\n🎟️ *Gate Pass PIN:* `{{ $json.payload.gate_pass_code }}`\n👤 *Sales Manager:* {{ $json.payload.rep_name }} ({{ $json.payload.rep_phone }})\n\n🗺️ *Turn-by-Turn Navigation:*\n{{ $json.payload.maps_url }}\n\nReply *DRIVER* to receive forwardable directions for your driver/cab.",
+        "additionalFields": {}
+      },
+      "id": "54268b5f-ddb8-4000-a7d8-352877f2cc46",
+      "name": "Send WhatsApp",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [
+        2096,
+        4928
+      ],
+      "webhookId": "333cc834-b901-4e07-8b77-af34ceb5f645"
+    },
+    {
+      "parameters": {
+        "fromEmail": "sitevisits@yourdomain.com",
+        "toEmail": "={{ $json.payload.lead_email }}",
+        "subject": "=Site Visit Confirmed: {{ $json.payload.project_name }}",
+        "options": {}
+      },
+      "id": "6d3bcc5c-157e-4470-8cd2-7bb9c8bd18c1",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2096,
+        5104
+      ],
+      "webhookId": "bf4ca01b-bae5-4fe8-b87d-18552ad8241f"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "YOUR_SLACK_SALES_CHANNEL_ID"
+        },
+        "text": "=🚗 *NEW SITE VISIT BOOKED*\n*Lead:* {{ $json.payload.lead_name }} ({{ $json.payload.lead_phone }})\n*Rep Assigned:* {{ $json.payload.rep_name }}\n*Scheduled Time:* {{ $json.payload.proposed_time }}",
+        "otherOptions": {}
+      },
+      "id": "8535f8e2-bee6-489f-bd6b-c1ab32a0dac8",
+      "name": "Slack Rep Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        2096,
+        5280
+      ],
+      "webhookId": "eff9694d-bb89-403e-b153-6d3e2b793e57",
+      "credentials": {
+        "slackApi": {
+          "id": "htdxbljsSJrXpXX0",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.outbox_actions SET status = 'sent', attempt_count = attempt_count + 1, updated_at = now() WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Claim Outbox Actions').item.json.id] }}"
+        }
+      },
+      "id": "6eabbcf2-73b1-4ef1-95b1-9b91a94a75ee",
+      "name": "Mark Action Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2384,
+        5104
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "8f719bbb-dacc-4eec-ada5-36b569fd15c7",
+      "name": "Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        3392,
+        5072
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT v.*, r.rep_name, r.phone_e164 AS rep_phone, p.name AS project_name, p.site_lat, p.site_lng\nFROM sitevisits.site_visits v\nJOIN sitevisits.reps r ON r.rep_id = v.rep_id\nJOIN sitevisits.projects p ON p.id = v.project_id\nWHERE v.status IN ('pending_confirmation', 'confirmed')\n  AND (\n    (v.scheduled_at - now() BETWEEN interval '23h50m' AND interval '24h10m' AND NOT v.reminder_24h_sent)\n    OR (v.scheduled_at - now() BETWEEN interval '1h50m' AND interval '2h10m' AND NOT v.reminder_2h_sent)\n    OR (v.scheduled_at - now() BETWEEN interval '20m' AND interval '40m' AND NOT v.reminder_30m_sent)\n    OR (v.scheduled_at - now() BETWEEN interval '-10m' AND interval '10m' AND NOT v.reminder_arrival_sent)\n  );",
+        "options": {}
+      },
+      "id": "c9970ed4-099b-44a0-af81-fe0d23716a10",
+      "name": "Find Due Visits",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3600,
+        5072
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "eb25eb65-3708-41d8-bc0d-6966a1e7f11c",
+      "name": "Loop Over Due Visits",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3824,
+        5072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const v = $input.item.json;\nconst hoursOut = (new Date(v.scheduled_at) - new Date()) / 3600000;\nlet stage;\nif (hoursOut > 6) stage = '24h';\nelse if (hoursOut > 1) stage = '2h';\nelse if (hoursOut > 0.2) stage = '30m';\nelse stage = 'arrival';\n\nconst mapsLink = `https://www.google.com/maps/dir/?api=1&destination=${v.site_lat},${v.site_lng}&travelmode=driving`;\n\nreturn {\n  json: {\n    ...v,\n    stage,\n    maps_link: mapsLink\n  }\n};"
+      },
+      "id": "9159acb8-3ad8-44de-9734-beaa5ea802d4",
+      "name": "Determine Stage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4048,
+        5072
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'whatsapp', 'reminder_' || $2, $3::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.id,\n  $json.stage,\n  JSON.stringify({\n    lead_phone: $json.lead_phone,\n    project_name: $json.project_name,\n    proposed_time: $json.scheduled_at,\n    maps_url: $json.maps_link,\n    gate_pass_code: $json.gate_pass_code,\n    rep_name: $json.rep_name,\n    rep_phone: $json.rep_phone\n  })\n] }}"
+        }
+      },
+      "id": "fdd73437-8a9d-49f6-b326-5c5bbae76c4e",
+      "name": "Write Outbox: Reminder",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4272,
+        5072
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits\nSET \n  reminder_24h_sent = CASE WHEN $2 = '24h' THEN true ELSE reminder_24h_sent END,\n  reminder_2h_sent = CASE WHEN $2 = '2h' THEN true ELSE reminder_2h_sent END,\n  reminder_30m_sent = CASE WHEN $2 = '30m' THEN true ELSE reminder_30m_sent END,\n  reminder_arrival_sent = CASE WHEN $2 = 'arrival' THEN true ELSE reminder_arrival_sent END,\n  status = CASE WHEN $2 = 'arrival' THEN 'awaiting_checkin' ELSE status END\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.stage] }}"
+        }
+      },
+      "id": "61aa1896-0100-48ff-b9bb-f30b5818b3c8",
+      "name": "Mark Reminder Sent + State Flip",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4480,
+        5072
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sitevisit/checkin",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "aa74b8cb-e392-4233-bcb4-82848c5225b9",
+      "name": "Check-In Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        5776
+      ],
+      "webhookId": "sitevisit-checkin"
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $input.item.json.body || {};\nreturn {\n  json: {\n    visit_id: b.visit_id || null,\n    gate_pass_code: b.gate_pass_code || null,\n    method: b.source === 'rep_button' ? 'rep_button' : 'gate_system'\n  }\n};"
+      },
+      "id": "064255a6-8974-4d81-9ac4-86e91f3acf20",
+      "name": "Extract Check-In Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        5776
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sitevisits.site_visits WHERE (id::text = $1 OR gate_pass_code = $2) AND status != 'arrived' LIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.visit_id, $json.gate_pass_code] }}"
+        }
+      },
+      "id": "3d481103-092c-4230-9e2a-a81fddd4dc2d",
+      "name": "Find Visit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1584,
+        5776
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "26049880-f2ef-4635-a8f7-a85eb5c402c7",
+      "name": "Found & Not Already Arrived?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        5776
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', message: 'Pass invalid or already checked-in' } }}",
+        "options": {
+          "responseCode": 404
+        }
+      },
+      "id": "9b8067a5-e78e-4102-9a55-bb36a3380ae4",
+      "name": "Respond Check-In Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1808,
+        5968
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits\nSET status = 'arrived', checked_in_at = now(), check_in_method = $2\nWHERE id = $1\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $('Extract Check-In Event').first().json.method] }}"
+        }
+      },
+      "id": "cd5d142f-0677-4650-ab82-447e58cef218",
+      "name": "Mark Arrived",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2032,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'crm_slack', 'visit_arrived', jsonb_build_object('lead_name', $2, 'phone', $3));",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lead_name, $json.lead_phone] }}"
+        }
+      },
+      "id": "2ca853e8-04f4-467e-8db4-8ccb183f624c",
+      "name": "Write Outbox: CRM Arrived",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2256,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload, scheduled_at)\nVALUES ($1, 'whatsapp', 'feedback_request', jsonb_build_object('lead_phone', $2, 'lead_name', $3), now() + interval '1 hour');",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lead_phone, $json.lead_name] }}"
+        }
+      },
+      "id": "35069733-72ed-4149-bd72-7456f24b08f6",
+      "name": "Write Outbox: Feedback Request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2496,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits SET status = 'completed', follow_up_done = true WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "id": "2a08dca1-41c9-4a74-b040-4d12e03c520d",
+      "name": "Mark Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2704,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'success', message: 'Checked-in successfully' } }}",
+        "options": {}
+      },
+      "id": "85548577-a93a-4ff0-83c2-efe62b23a30e",
+      "name": "Respond Gate 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2928,
+        5776
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "f86b9aef-0314-4298-8356-dfa6baba3561",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        3376,
+        5776
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM sitevisits.site_visits\nWHERE status = 'awaiting_checkin'\n  AND scheduled_at < now() - interval '30 minutes'\nFOR UPDATE SKIP LOCKED;",
+        "options": {}
+      },
+      "id": "d9e12eca-071d-4104-ae1c-5cdf7aff0cf8",
+      "name": "Find Overdue Check-Ins",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3584,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "0382d783-fc0a-42ce-a9f3-41f93c492f0d",
+      "name": "Loop Over No-Shows",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3808,
+        5776
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits\nSET status = 'no_show', no_show_marked_at = now()\nWHERE id = $1\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "id": "3d4ab33b-ce0a-428c-ac22-4656f09d38b7",
+      "name": "Mark No-Show",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4032,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'crm_slack', 'no_show_alert', jsonb_build_object('lead_name', $2, 'phone', $3));",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lead_name, $json.lead_phone] }}"
+        }
+      },
+      "id": "6291cc12-649c-4290-a3b1-f871371aaf66",
+      "name": "Write Outbox: Sales Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4256,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sitevisits.outbox_actions (visit_id, channel, action_type, payload)\nVALUES ($1, 'crm_slack', 'sales_task', jsonb_build_object('lead_name', $2, 'instruction', 'Client missed site visit - initiate re-engagement call'));",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lead_name] }}"
+        }
+      },
+      "id": "4d5077b5-5d2d-4e87-b4e8-91def5d25bd4",
+      "name": "Write Outbox: Rep Re-engage Nudge",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4480,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sitevisits.site_visits SET sales_task_created = true, follow_up_done = true WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "id": "afbe57a7-58d3-4166-836e-d4b30d6493b4",
+      "name": "Mark Sales Task Created",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4720,
+        5776
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Book Visit Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate + Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate + Authenticate": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401/400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Already Processed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Processed?": {
+      "main": [
+        [
+          {
+            "node": "Respond Cached Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Lead / Project",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Lead / Project": {
+      "main": [
+        [
+          {
+            "node": "Reserve & Create Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve & Create Booking": {
+      "main": [
+        [
+          {
+            "node": "Slot Reserved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Reserved?": {
+      "main": [
+        [
+          {
+            "node": "Build Visit Assets & Deep Link",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Slot Taken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Visit Assets & Deep Link": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Update Booking State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Booking State": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: Email": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: CRM/Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: CRM/Slack": {
+      "main": [
+        [
+          {
+            "node": "Record Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 (Booked)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 1 Minute": {
+      "main": [
+        [
+          {
+            "node": "Claim Outbox Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Outbox Actions": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Actions": {
+      "main": [
+        [
+          {
+            "node": "Route By Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Channel": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Rep Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Mark Action Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Mark Action Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Rep Alert": {
+      "main": [
+        [
+          {
+            "node": "Mark Action Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Action Sent": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Find Due Visits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Due Visits": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Due Visits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Due Visits": {
+      "main": [
+        [
+          {
+            "node": "Determine Stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Stage": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: Reminder": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminder Sent + State Flip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Reminder Sent + State Flip": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Due Visits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check-In Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Check-In Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Check-In Event": {
+      "main": [
+        [
+          {
+            "node": "Find Visit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Visit": {
+      "main": [
+        [
+          {
+            "node": "Found & Not Already Arrived?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Found & Not Already Arrived?": {
+      "main": [
+        [
+          {
+            "node": "Mark Arrived",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Check-In Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Arrived": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: CRM Arrived",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: CRM Arrived": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: Feedback Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: Feedback Request": {
+      "main": [
+        [
+          {
+            "node": "Mark Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Completed": {
+      "main": [
+        [
+          {
+            "node": "Respond Gate 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Find Overdue Check-Ins",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Overdue Check-Ins": {
+      "main": [
+        [
+          {
+            "node": "Loop Over No-Shows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over No-Shows": {
+      "main": [
+        [
+          {
+            "node": "Mark No-Show",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark No-Show": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: Sales Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: Sales Alert": {
+      "main": [
+        [
+          {
+            "node": "Write Outbox: Rep Re-engage Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Outbox: Rep Re-engage Nudge": {
+      "main": [
+        [
+          {
+            "node": "Mark Sales Task Created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Sales Task Created": {
+      "main": [
+        [
+          {
+            "node": "Loop Over No-Shows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "cdf7fc00-6bd4-46b8-b579-919730c85af8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ab782a197a34b627a970462134e9e8786494badc720390c65408c52487825c6c"
+  },
+  "nodeGroups": [],
+  "id": "VC3vI5VUmtYF8CnF",
+  "tags": []
+}
